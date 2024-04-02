@@ -62,6 +62,7 @@ pub struct Run {
     engine: Arc<Engine>,
     task_access: TaskAccess,
     analytics_handle: Option<AnalyticsHandle>,
+    should_print_prelude: bool,
 }
 
 impl Run {
@@ -110,7 +111,7 @@ impl Run {
     // We split this into a separate function because we need
     // to close the AnalyticsHandle regardless of whether the run succeeds or not
     async fn run_with_analytics(&mut self) -> Result<i32, Error> {
-        if self.opts.run_opts.dry_run.is_none() && self.opts.run_opts.graph.is_none() {
+        if self.should_print_prelude {
             self.print_run_prelude();
         }
 
