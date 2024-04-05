@@ -31,6 +31,14 @@ pub struct HashSpec {
     pub inputs: Option<GlobSet>,
 }
 
+impl HashSpec {
+    fn is_package_local(&self) -> bool {
+        self.inputs
+            .map(|glob_set| glob_set.is_package_local())
+            .unwrap_or(true)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("package hashing encountered an error: {0}")]
@@ -39,6 +47,8 @@ pub enum Error {
     Unavailable(String),
     #[error("package not found: {} {:?}", .0.package_path, .0.inputs)]
     UnknownPackage(HashSpec),
+    #[error("unsupported: glob traverses out of the package")]
+    UnsupportedGlob,
 }
 
 // Communication errors that all funnel to Unavailable
@@ -260,13 +270,44 @@ impl FileHashes {
         }
     }
 
-    fn get_package_path(&self, file_path: &AnchoredSystemPath) -> Option<&AnchoredSystemPath> {
+    // fn get_package_path(&self, file_path: &AnchoredSystemPath) ->
+    // Option<&AnchoredSystemPath> {     self.0
+    //         .get_ancestor(file_path.as_str())
+    //         .and_then(|subtrie| subtrie.key())
+    //         .map(|package_path| {
+    //             AnchoredSystemPath::new(package_path).expect("keys are valid
+    // AnchoredSystemPaths")         })
+    // }
+
+    fn get_changed_specs(&self, file_path: &AnchoredSystemPath) -> HashSet<HashSpec> {
         self.0
             .get_ancestor(file_path.as_str())
-            .and_then(|subtrie| subtrie.key())
-            .map(|package_path| {
-                AnchoredSystemPath::new(package_path).expect("keys are valid AnchoredSystemPaths")
+            // verify we have a key
+            .and_then(|subtrie| subtrie.key().map(|key| (key, subtrie)))
+            // convert key to AnchoredSystemPath, and verify we have a value
+            .and_then(|(package_path, subtrie)| {
+                let package_path = AnchoredSystemPath::new(package_path)
+                    .expect("keys are valid AnchoredSystemPaths");
+                subtrie.value().map(|specs| (package_path, specs))
             })
+            // now that we have a path and a set of specs, filter the specs to the relevant ones
+            .map(|(package_path, maybe_glob_sets)| {
+                maybe_glob_sets
+                    .keys()
+                    .filter_map(|maybe_glob_set| match maybe_glob_set {
+                        None => Some(HashSpec {
+                            package_path: package_path.to_owned(),
+                            inputs: None,
+                        }),
+                        Some(glob_set) if glob_set.matches(file_path) => Some(HashSpec {
+                            package_path: package_path.to_owned(),
+                            inputs: Some(glob_set.clone()),
+                        }),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default()
     }
 
     fn drain(&mut self, reason: &str) {
@@ -392,7 +433,7 @@ impl Subscriber {
                     }
                 },
                 Some(query) = self.query_rx.recv() => {
-                    self.handle_query(query, &mut hashes);
+                    self.handle_query(query, &mut hashes, &hash_update_tx);
                 }
             }
         }
@@ -414,9 +455,19 @@ impl Subscriber {
 
     // We currently only support a single query, getting hashes for a given
     // HashSpec.
-    fn handle_query(&self, query: Query, hashes: &mut FileHashes) {
+    fn handle_query(
+        &self,
+        query: Query,
+        hashes: &mut FileHashes,
+        hash_update_tx: &mpsc::Sender<HashUpdate>,
+    ) {
         match query {
             Query::GetHash(spec, tx) => {
+                // // We don't currently support inputs that are not package-local.
+                // if !spec.is_package_local() {
+                //     let _ = tx.send(Err(Error::UnsupportedGlob));
+                //     return;
+                // }
                 if let Some(state) = hashes.get_mut(&spec) {
                     match state {
                         HashState::Hashes(hashes) => {
@@ -430,7 +481,10 @@ impl Subscriber {
                         }
                     }
                 } else {
-                    let _ = tx.send(Err(Error::UnknownPackage(spec)));
+                    let (version, debouncer) = self.queue_package_hash(&spec, hash_update_tx, true);
+                    // this request will likely time out. However, if the client has asked for
+                    // this spec once, they might ask again, and we can start tracking it.
+                    hashes.insert(spec, HashState::Pending(version, debouncer, vec![tx]));
                 }
             }
         }
@@ -477,13 +531,19 @@ impl Subscriber {
         &self,
         spec: &HashSpec,
         hash_update_tx: &mpsc::Sender<HashUpdate>,
+        immediate: bool,
     ) -> (Version, Arc<HashDebouncer>) {
         let version = Version(self.next_version.fetch_add(1, Ordering::SeqCst));
         let tx = hash_update_tx.clone();
         let spec = spec.clone();
         let repo_root = self.repo_root.clone();
         let scm = self.scm.clone();
-        let debouncer = Arc::new(HashDebouncer::default());
+        let debouncer = if immediate {
+            HashDebouncer::new(Duration::from_millis(0))
+        } else {
+            HashDebouncer::default()
+        };
+        let debouncer = Arc::new(debouncer);
         let debouncer_copy = debouncer.clone();
         tokio::task::spawn(async move {
             debouncer_copy.debounce().await;
@@ -513,7 +573,7 @@ impl Subscriber {
         hashes: &mut FileHashes,
         hash_update_tx: &mpsc::Sender<HashUpdate>,
     ) {
-        let mut changed_packages: HashSet<AnchoredSystemPathBuf> = HashSet::new();
+        let mut changed_specs: HashSet<HashSpec> = HashSet::new();
         for path in event.paths {
             let path = AbsoluteSystemPathBuf::try_from(path).expect("event path is a valid path");
             let repo_relative_change_path = self
@@ -522,30 +582,33 @@ impl Subscriber {
                 .expect("event path is in the repository");
             // If this change is not relevant to a package, ignore it
             trace!("file change at {:?}", repo_relative_change_path);
-            if let Some(package_path) = hashes.get_package_path(&repo_relative_change_path) {
+            let changed_specs_for_path = hashes.get_changed_specs(&repo_relative_change_path);
+            if !changed_specs_for_path.is_empty() {
                 // We have a file change in a package, and we haven't seen this package yet.
                 // Queue it for rehashing.
                 // TODO: further qualification. Which sets of inputs? Is this file .gitignored?
                 // We are somewhat saved here by deferring to the SCM to do the hashing. A
                 // change to a gitignored file will trigger a re-hash, but won't
                 // actually affect what the hash is.
-                trace!("package changed: {:?}", package_path);
-                changed_packages.insert(package_path.to_owned());
+                trace!("specs changed: {:?}", changed_specs_for_path);
+                //changed_specs.insert(package_path.to_owned());
+                changed_specs.extend(changed_specs_for_path.into_iter());
             } else {
                 trace!("Ignoring change to {repo_relative_change_path}");
             }
         }
         // TODO: handle different sets of inputs
-        for package_path in changed_packages {
-            let spec = HashSpec {
-                package_path,
-                inputs: None,
-            };
+
+        // Any rehashing we do was triggered by a file event, so don't do it
+        // immediately. Wait for the debouncer to time out instead.
+        let immediate = false;
+        for spec in changed_specs {
             match hashes.get_mut(&spec) {
                 // Technically this shouldn't happen, the package_paths are sourced from keys in
                 // hashes.
                 None => {
-                    let (version, debouncer) = self.queue_package_hash(&spec, hash_update_tx);
+                    let (version, debouncer) =
+                        self.queue_package_hash(&spec, hash_update_tx, immediate);
                     hashes.insert(spec, HashState::Pending(version, debouncer, vec![]));
                 }
                 Some(entry) => {
@@ -555,7 +618,7 @@ impl Subscriber {
                             // progress. Drop this calculation and start
                             // a new one
                             let (version, debouncer) =
-                                self.queue_package_hash(&spec, hash_update_tx);
+                                self.queue_package_hash(&spec, hash_update_tx, immediate);
                             let mut swap_target = vec![];
                             std::mem::swap(txs, &mut swap_target);
                             *entry = HashState::Pending(version, debouncer, swap_target);
@@ -563,7 +626,8 @@ impl Subscriber {
                     } else {
                         // it's not a pending hash calculation, overwrite the entry with a new
                         // pending calculation
-                        let (version, debouncer) = self.queue_package_hash(&spec, hash_update_tx);
+                        let (version, debouncer) =
+                            self.queue_package_hash(&spec, hash_update_tx, immediate);
                         *entry = HashState::Pending(version, debouncer, vec![]);
                     }
                 }
@@ -596,13 +660,17 @@ impl Subscriber {
                     |package_path| !package_paths.contains(package_path),
                     "package was removed",
                 );
+                // package data updates are triggered by file events, so don't immediately
+                // start rehashing, use the debouncer to wait for a quiet period.
+                let immediate = false;
                 for package_path in package_paths {
                     let spec = HashSpec {
                         package_path,
                         inputs: None,
                     };
                     if !hashes.contains_key(&spec) {
-                        let (version, debouncer) = self.queue_package_hash(&spec, hash_update_tx);
+                        let (version, debouncer) =
+                            self.queue_package_hash(&spec, hash_update_tx, immediate);
                         hashes.insert(spec, HashState::Pending(version, debouncer, vec![]));
                     }
                 }
