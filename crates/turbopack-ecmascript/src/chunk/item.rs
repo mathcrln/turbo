@@ -246,8 +246,12 @@ async fn module_factory_with_code_generation_issue(
                 CodeGenerationIssue {
                     severity: IssueSeverity::Error.cell(),
                     path: chunk_item.asset_ident().path(),
-                    title: StyledString::Text("Code generation for chunk item errored".to_string())
-                        .cell(),
+                    title: StyledString::Text(
+                        "Code generation for chunk item
+    errored"
+                            .to_string(),
+                    )
+                    .cell(),
                     message: StyledString::Text(error_message).cell(),
                 }
                 .cell()
@@ -260,6 +264,11 @@ async fn module_factory_with_code_generation_issue(
             }
         },
     )
+    // chunk_item
+    //     .content_with_async_module_info(async_module_info)
+    //     .module_factory()
+    //     .resolve()
+    //     .await
 }
 
 #[turbo_tasks::value(transparent)]
