@@ -26,7 +26,7 @@ use turborepo_telemetry::events::{
     repo::{RepoEventBuilder, RepoType},
     EventBuilder, TrackedErrors,
 };
-use turborepo_ui::{ColorSelector, UI};
+use turborepo_ui::{tui, tui::AppSender, ColorSelector, UI};
 #[cfg(feature = "daemon-package-discovery")]
 use {
     crate::run::package_discovery::DaemonPackageDiscovery,
@@ -59,6 +59,8 @@ pub struct RunBuilder {
     ui: UI,
     version: &'static str,
     experimental_ui: bool,
+    // If we have an existing sender, we can pass it here
+    experimental_ui_sender: Option<AppSender>,
     api_client: APIClient,
     // In watch mode, we can have a changed package that we want to serve as an entrypoint.
     // We will then prune away any tasks that do not depend on tasks inside
@@ -114,6 +116,7 @@ impl RunBuilder {
             ui,
             version,
             experimental_ui,
+            experimental_ui_sender: None,
             entrypoint_package: None,
             should_print_prelude_override: None,
         })
@@ -121,6 +124,15 @@ impl RunBuilder {
 
     pub fn with_entrypoint_package(mut self, entrypoint_package: PackageName) -> Self {
         self.entrypoint_package = Some(entrypoint_package);
+        self
+    }
+
+    // If we've already started a UI thread, use that
+    pub fn with_existing_experimental_ui(
+        mut self,
+        experimental_ui_sender: Option<AppSender>,
+    ) -> Self {
+        self.experimental_ui_sender = experimental_ui_sender;
         self
     }
 
@@ -405,10 +417,27 @@ impl RunBuilder {
             self.opts.run_opts.dry_run.is_none() && self.opts.run_opts.graph.is_none()
         });
 
+        let (experimental_ui_sender, experimental_ui_handle) = match &self.experimental_ui_sender {
+            Some(sender) if self.experimental_ui => {
+                println!("1");
+                // We already have the UI thread, so use the sender, but don't keep a handle
+                (Some(sender.clone()), None)
+            }
+            None if self.experimental_ui => {
+                println!("2");
+                let task_names = engine.tasks_with_command(&pkg_dep_graph);
+                let (handle, receiver) = AppSender::new();
+                let app = tokio::task::spawn_blocking(move || tui::run_app(task_names, receiver));
+                (Some(handle), Some(app))
+            }
+            _ => (None, None),
+        };
+
         Ok(Run {
             version: self.version,
             ui: self.ui,
-            experimental_ui: self.experimental_ui,
+            experimental_ui_sender,
+            experimental_ui_handle,
             analytics_handle,
             start_at,
             processes: self.processes,

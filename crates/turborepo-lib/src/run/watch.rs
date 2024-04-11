@@ -6,6 +6,7 @@ use thiserror::Error;
 use tokio::{select, task::JoinHandle};
 use turborepo_repository::package_graph::PackageName;
 use turborepo_telemetry::events::command::CommandEventBuilder;
+use turborepo_ui::tui::AppSender;
 
 use crate::{
     cli::{Command, ExecutionArgs, RunArgs},
@@ -83,6 +84,12 @@ impl WatchClient {
 
         run.print_run_prelude();
 
+        println!(
+            "run sender is some: {}",
+            run.experimental_ui_sender.is_some()
+        );
+        let ui = &run.experimental_ui_sender;
+
         let has_persistent_tasks = run.has_persistent_tasks();
         let mut filtered_pkgs = run.filtered_pkgs;
 
@@ -110,6 +117,7 @@ impl WatchClient {
                     &handler,
                     &mut main_run_handle,
                     has_persistent_tasks,
+                    ui.clone(),
                 )
                 .await?;
             }
@@ -140,6 +148,7 @@ impl WatchClient {
         handler: &SignalHandler,
         main_run_handle: &mut Option<JoinHandle<Result<i32, run::error::Error>>>,
         has_persistent_tasks: bool,
+        ui_sender: Option<AppSender>,
     ) -> Result<(), Error> {
         // Should we recover here?
         match event {
@@ -184,6 +193,7 @@ impl WatchClient {
                     tokio::spawn(async move {
                         let mut run = RunBuilder::new(new_base)?
                             .with_entrypoint_package(package_name)
+                            .with_existing_experimental_ui(ui_sender)
                             .hide_prelude()
                             .build(&signal_handler, telemetry)
                             .await?;
@@ -220,9 +230,9 @@ impl WatchClient {
                 let handler = handler.clone();
                 let run_fut = async move {
                     let base = CommandBase::new(args, repo_root, get_version(), ui);
-
                     let mut run = RunBuilder::new(base)?
                         .hide_prelude()
+                        .with_existing_experimental_ui(ui_sender)
                         .build(&handler, telemetry)
                         .await?;
 

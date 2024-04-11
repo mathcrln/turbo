@@ -16,7 +16,8 @@ use std::{collections::HashSet, io::Write, sync::Arc};
 
 pub use cache::{ConfigCache, RunCache, TaskCache};
 use chrono::{DateTime, Local};
-use tracing::debug;
+use tokio::task::JoinHandle;
+use tracing::{debug, error};
 use turbopath::AbsoluteSystemPathBuf;
 use turborepo_analytics::AnalyticsHandle;
 use turborepo_api_client::{APIAuth, APIClient};
@@ -25,7 +26,7 @@ use turborepo_env::EnvironmentVariableMap;
 use turborepo_repository::package_graph::{PackageGraph, PackageName};
 use turborepo_scm::SCM;
 use turborepo_telemetry::events::generic::GenericEventBuilder;
-use turborepo_ui::{cprint, cprintln, BOLD_GREY, GREY, UI};
+use turborepo_ui::{cprint, cprintln, tui, tui::AppSender, BOLD_GREY, GREY, UI};
 
 pub use crate::run::error::Error;
 use crate::{
@@ -43,7 +44,6 @@ use crate::{
 pub struct Run {
     version: &'static str,
     ui: UI,
-    experimental_ui: bool,
     start_at: DateTime<Local>,
     processes: ProcessManager,
     run_telemetry: GenericEventBuilder,
@@ -63,6 +63,8 @@ pub struct Run {
     task_access: TaskAccess,
     analytics_handle: Option<AnalyticsHandle>,
     should_print_prelude: bool,
+    experimental_ui_sender: Option<AppSender>,
+    experimental_ui_handle: Option<JoinHandle<Result<(), tui::Error>>>,
 }
 
 impl Run {
@@ -226,7 +228,7 @@ impl Run {
             self.processes.clone(),
             &self.repo_root,
             global_env,
-            self.experimental_ui,
+            self.experimental_ui_sender.clone(),
         );
 
         if self.opts.run_opts.dry_run.is_some() {
@@ -247,6 +249,19 @@ impl Run {
             .max()
             // We hit some error, it shouldn't be exit code 0
             .unwrap_or(if errors.is_empty() { 0 } else { 1 });
+
+        // If we own the handle, we should stop the UI here.
+        // If we don't own the handle, then it's likely owned
+        // by the caller, i.e. the watch client
+        if let (Some(ui), Some(render_thread_handle)) = (
+            &self.experimental_ui_sender,
+            self.experimental_ui_handle.take(),
+        ) {
+            ui.stop();
+            if let Err(e) = render_thread_handle.await.expect("render thread panicked") {
+                error!("error encountered rendering tui: {e}");
+            }
+        }
 
         let error_prefix = if self.opts.run_opts.is_github_actions {
             "::error::"
